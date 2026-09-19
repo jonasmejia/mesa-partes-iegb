@@ -5,6 +5,7 @@ namespace App\Services\Derivaciones;
 use App\Models\Derivacion;
 use App\Models\Documento;
 use App\Models\Estado;
+use App\Models\Recepcion;
 use App\Models\UserCargo;
 use App\Services\Auditoria\AuditoriaService;
 use App\Services\Movimientos\MovimientoService;
@@ -16,8 +17,7 @@ class RecepcionDerivacionService
     public function __construct(
         private readonly MovimientoService $movimientoService,
         private readonly AuditoriaService $auditoriaService,
-    ) {
-    }
+    ) {}
 
     public function recibir(
         Derivacion $derivacion,
@@ -90,7 +90,7 @@ class RecepcionDerivacionService
             if ($derivacion->fecha_recepcion !== null) {
                 throw ValidationException::withMessages([
                     'derivacion' =>
-                        'La derivación ya fue recibida anteriormente.',
+                    'La derivación ya fue recibida anteriormente.',
                 ]);
             }
 
@@ -136,10 +136,29 @@ class RecepcionDerivacionService
 
             $derivacion->update([
                 'estado_id' =>
-                    $estadoRecibida->id,
+                $estadoRecibida->id,
 
                 'fecha_recepcion' =>
-                    now(),
+                now(),
+            ]);
+
+            /*
+            |--------------------------------------------------------------------------
+            | Registrar recepción
+            |--------------------------------------------------------------------------
+            */
+
+            Recepcion::create([
+                'derivacion_id' => $derivacion->id,
+
+                'recibido_por' => $recibidoPor,
+
+                'resultado' => 'RECIBIDO',
+
+                'observacion' => null,
+
+                'fecha_recepcion' =>
+                    $derivacion->fecha_recepcion,
             ]);
 
 
@@ -178,7 +197,6 @@ class RecepcionDerivacionService
 
 
             return $derivacion->fresh();
-
         }, 3);
     }
 
@@ -200,7 +218,7 @@ class RecepcionDerivacionService
         if (! $estado) {
             throw ValidationException::withMessages([
                 'estado_derivacion' =>
-                    "No se encuentra configurado el estado {$codigo}.",
+                "No se encuentra configurado el estado {$codigo}.",
             ]);
         }
 
@@ -229,10 +247,10 @@ class RecepcionDerivacionService
 
             throw ValidationException::withMessages([
                 'derivacion' =>
-                    sprintf(
-                        'La derivación no puede ser recibida porque actualmente se encuentra en estado %s.',
-                        $estadoActual?->codigo ?? 'DESCONOCIDO'
-                    ),
+                sprintf(
+                    'La derivación no puede ser recibida porque actualmente se encuentra en estado %s.',
+                    $estadoActual?->codigo ?? 'DESCONOCIDO'
+                ),
             ]);
         }
     }
@@ -271,7 +289,7 @@ class RecepcionDerivacionService
         if (! $asignacionVigente) {
             throw ValidationException::withMessages([
                 'recibido_por' =>
-                    'El usuario no pertenece actualmente al área destino de la derivación.',
+                'El usuario no pertenece actualmente al área destino de la derivación.',
             ]);
         }
     }
@@ -287,15 +305,65 @@ class RecepcionDerivacionService
         Documento $documento,
         int $areaDestinoId
     ): void {
+
+        /*
+    |--------------------------------------------------------------------------
+    | 1. Documento con una única ubicación
+    |--------------------------------------------------------------------------
+    |
+    | Si area_actual_id coincide con el destino de la derivación,
+    | la recepción es válida.
+    |
+    */
+
         if (
-            (int) $documento->area_actual_id
-            !==
-            (int) $areaDestinoId
+            $documento->area_actual_id !== null &&
+            (int) $documento->area_actual_id === (int) $areaDestinoId
         ) {
-            throw ValidationException::withMessages([
-                'documento' =>
-                    'El documento ya no se encuentra en el área destino de esta derivación.',
-            ]);
+            return;
         }
+
+        /*
+    |--------------------------------------------------------------------------
+    | 2. Documento con múltiples destinos activos
+    |--------------------------------------------------------------------------
+    |
+    | Cuando area_actual_id es NULL, la ubicación del documento se
+    | determina mediante sus derivaciones activas.
+    |
+    */
+
+        if ($documento->area_actual_id === null) {
+
+            $estadosActivos = Estado::query()
+                ->where('ambito', 'DERIVACION')
+                ->whereIn('codigo', [
+                    'DER_PENDIENTE',
+                    'DER_ENVIADA',
+                    'DER_RECIBIDA',
+                ])
+                ->pluck('id');
+
+            $existeDerivacionActiva = Derivacion::query()
+                ->where('documento_id', $documento->id)
+                ->where('area_destino_id', $areaDestinoId)
+                ->whereIn('estado_id', $estadosActivos)
+                ->exists();
+
+            if ($existeDerivacionActiva) {
+                return;
+            }
+        }
+
+        /*
+    |--------------------------------------------------------------------------
+    | 3. Documento no disponible en el área destino
+    |--------------------------------------------------------------------------
+    */
+
+        throw ValidationException::withMessages([
+            'documento' =>
+            'El documento ya no se encuentra disponible en el área destino de esta derivación.',
+        ]);
     }
 }

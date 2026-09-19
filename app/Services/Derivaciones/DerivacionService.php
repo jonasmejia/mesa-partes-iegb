@@ -13,6 +13,8 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 use Throwable;
 
+
+
 class DerivacionService
 {
     public function __construct(
@@ -59,7 +61,8 @@ class DerivacionService
                 */
 
                 $this->validarSinDerivacionAbierta(
-                    $documento
+                    documento: $documento,
+                    permitirMultiples: (bool) ($datos['permitir_multiples'] ?? false),
                 );
                 /*
                 |--------------------------------------------------------------------------
@@ -70,6 +73,7 @@ class DerivacionService
                 $this->validarAreaOrigen(
                     documento: $documento,
                     areaOrigenId: $datos['area_origen_id'],
+                    permitirMultiples: (bool) ($datos['permitir_multiples'] ?? false),
                 );
 
                 /*
@@ -93,6 +97,8 @@ class DerivacionService
                 $this->validarDestino(
                     areaOrigenId: $datos['area_origen_id'],
                     areaDestinoId: $datos['area_destino_id'],
+                    responsableDestinoId: $datos['responsable_destino_id'] ?? null,
+                    derivadoPor: $datos['derivado_por'],
                 );
 
                 /*
@@ -108,6 +114,19 @@ class DerivacionService
                         campo: 'responsable_destino_id',
                     );
                 }
+
+                /*
+                |--------------------------------------------------------------------------
+                | 5.1 Evitar destinatario duplicado
+                |--------------------------------------------------------------------------
+                */
+
+                $this->validarDestinatarioNoDuplicado(
+                    documento: $documento,
+                    areaDestinoId: $datos['area_destino_id'],
+                    responsableDestinoId: $datos['responsable_destino_id'] ?? null,
+                );
+
 
                 /*
                 |--------------------------------------------------------------------------
@@ -194,12 +213,28 @@ class DerivacionService
                 |--------------------------------------------------------------------------
                 */
 
-                $documento->update([
-                    'estado_id' =>
-                    $estadoDocumento->id,
+                /*
+                |--------------------------------------------------------------------------
+                | Actualizar estado y ubicación lógica del documento
+                |--------------------------------------------------------------------------
+                |
+                | Si existe una sola derivación abierta, area_actual_id representa
+                | el área destino.
+                |
+                | Si existen varias derivaciones abiertas simultáneamente,
+                | area_actual_id queda NULL porque el documento tiene múltiples
+                | ubicaciones activas.
+                |
+                */
 
-                    'area_actual_id' =>
-                    $datos['area_destino_id'],
+                $areaActualId = $this->determinarAreaActual(
+                    documento: $documento,
+                    nuevaAreaDestinoId: $datos['area_destino_id'],
+                );
+
+                $documento->update([
+                    'estado_id' => $estadoDocumento->id,
+                    'area_actual_id' => $areaActualId,
                 ]);
 
                 /*
@@ -248,30 +283,144 @@ class DerivacionService
         }
     }
 
+    /**
+     * Valida que el documento pueda ser derivado desde el área indicada.
+     *
+     * En un flujo normal, el área de origen debe coincidir con
+     * area_actual_id.
+     *
+     * En un envío múltiple, después de la primera derivación
+     * area_actual_id puede apuntar al primer destino o quedar NULL.
+     * En ese caso se permite continuar agregando destinatarios
+     * únicamente si ya existe una derivación abierta originada
+     * desde la misma área.
+     */
     private function validarAreaOrigen(
         Documento $documento,
-        int $areaOrigenId
+        int $areaOrigenId,
+        bool $permitirMultiples = false
     ): void {
-        if (
-            (int) $documento->area_actual_id
-            !==
-            (int) $areaOrigenId
-        ) {
-            throw ValidationException::withMessages([
-                'area_origen_id' =>
-                'El documento ya no se encuentra en el área de origen indicada.',
-            ]);
+
+        /*
+    |--------------------------------------------------------------------------
+    | 1. Flujo normal
+    |--------------------------------------------------------------------------
+    */
+
+        if ($documento->area_actual_id === $areaOrigenId) {
+            return;
         }
+
+        /*
+    |--------------------------------------------------------------------------
+    | 2. Continuación de un envío múltiple
+    |--------------------------------------------------------------------------
+    */
+
+        if ($permitirMultiples) {
+
+            $codigosAbiertos = [
+                'DER_PENDIENTE',
+                'DER_ENVIADA',
+                'DER_RECIBIDA',
+            ];
+
+            $estadosAbiertos = Estado::query()
+                ->where('ambito', 'DERIVACION')
+                ->whereIn('codigo', $codigosAbiertos)
+                ->pluck('id');
+
+            if ($estadosAbiertos->count() !== count($codigosAbiertos)) {
+                throw ValidationException::withMessages([
+                    'estado_derivacion' =>
+                    'La configuración de estados de derivación está incompleta.',
+                ]);
+            }
+
+            $existeEnvioMultipleDesdeOrigen = Derivacion::query()
+                ->where('documento_id', $documento->id)
+                ->where('area_origen_id', $areaOrigenId)
+                ->whereIn('estado_id', $estadosAbiertos)
+                ->exists();
+
+            if ($existeEnvioMultipleDesdeOrigen) {
+                return;
+            }
+        }
+
+        /*
+    |--------------------------------------------------------------------------
+    | 3. No está autorizado para derivar desde esa área
+    |--------------------------------------------------------------------------
+    */
+
+        throw ValidationException::withMessages([
+            'area_origen_id' =>
+            'El documento no se encuentra disponible para ser derivado desde el área indicada.',
+        ]);
     }
 
     private function validarDestino(
         int $areaOrigenId,
-        int $areaDestinoId
+        int $areaDestinoId,
+        ?int $responsableDestinoId,
+        int $derivadoPor
     ): void {
-        if ($areaOrigenId === $areaDestinoId) {
+
+        /*
+    |--------------------------------------------------------------------------
+    | CASO 1: áreas diferentes
+    |--------------------------------------------------------------------------
+    |
+    | Es una derivación institucional normal:
+    |
+    | ARC -> Secretaría Académica
+    |
+    */
+
+        if ($areaOrigenId !== $areaDestinoId) {
+            return;
+        }
+
+        /*
+    |--------------------------------------------------------------------------
+    | CASO 2: misma área
+    |--------------------------------------------------------------------------
+    |
+    | Una derivación dentro de la misma área solamente tiene sentido
+    | cuando existe un destinatario personal.
+    |
+    | Ejemplo:
+    |
+    | Docente ARC -> Coordinador ARC
+    | Coordinador ARC -> Docente ARC
+    |
+    */
+
+        if ($responsableDestinoId === null) {
+
             throw ValidationException::withMessages([
-                'area_destino_id' =>
-                'El área de destino debe ser diferente al área de origen.',
+                'responsable_destino_id' =>
+                'Cuando el área de origen y destino son la misma, debe indicarse un destinatario específico.',
+            ]);
+        }
+
+        /*
+    |--------------------------------------------------------------------------
+    | Evitar autoenvío
+    |--------------------------------------------------------------------------
+    |
+    | No tendría sentido:
+    |
+    | Usuario X -> Usuario X
+    |
+    */
+
+        if ($responsableDestinoId === $derivadoPor) {
+
+            throw ValidationException::withMessages([
+                'responsable_destino_id' =>
+                'El usuario emisor no puede derivarse el documento a sí mismo.',
             ]);
         }
     }
@@ -305,6 +454,48 @@ class DerivacionService
             throw ValidationException::withMessages([
                 $campo =>
                 'El usuario no tiene una asignación vigente en el área indicada.',
+            ]);
+        }
+    }
+
+    private function validarDestinatarioNoDuplicado(
+        Documento $documento,
+        int $areaDestinoId,
+        ?int $responsableDestinoId
+    ): void {
+
+        $query = Derivacion::query()
+            ->where('documento_id', $documento->id)
+            ->where('area_destino_id', $areaDestinoId);
+
+        /*
+    |--------------------------------------------------------------------------
+    | Destinatario personal
+    |--------------------------------------------------------------------------
+    */
+
+        if ($responsableDestinoId !== null) {
+
+            $query->where(
+                'responsable_destino_id',
+                $responsableDestinoId
+            );
+        } else {
+
+            /*
+        |--------------------------------------------------------------------------
+        | Destinatario institucional: área completa
+        |--------------------------------------------------------------------------
+        */
+
+            $query->whereNull('responsable_destino_id');
+        }
+
+        if ($query->exists()) {
+
+            throw ValidationException::withMessages([
+                'responsable_destino_id' =>
+                'El documento ya fue derivado al destinatario indicado.',
             ]);
         }
     }
@@ -384,8 +575,77 @@ class DerivacionService
     }
 
     private function validarSinDerivacionAbierta(
-        Documento $documento
+        Documento $documento,
+        bool $permitirMultiples = false
     ): void {
+
+        /*
+    |--------------------------------------------------------------------------
+    | Envío múltiple
+    |--------------------------------------------------------------------------
+    |
+    | Cuando la operación ha sido declarada expresamente como múltiple,
+    | permitimos varias derivaciones abiertas para el mismo documento.
+    |
+    | Ejemplo:
+    |
+    | Memorándum múltiple
+    |     -> Docente A
+    |     -> Docente B
+    |     -> Docente C
+    |
+    */
+
+        if ($permitirMultiples) {
+            return;
+        }
+
+        /*
+    |--------------------------------------------------------------------------
+    | Flujo normal
+    |--------------------------------------------------------------------------
+    */
+
+        $codigosAbiertos = [
+            'DER_PENDIENTE',
+            'DER_ENVIADA',
+            'DER_RECIBIDA',
+        ];
+
+        $estadosAbiertos = Estado::query()
+            ->where('ambito', 'DERIVACION')
+            ->whereIn('codigo', $codigosAbiertos)
+            ->pluck('id');
+
+        if ($estadosAbiertos->count() !== count($codigosAbiertos)) {
+
+            throw ValidationException::withMessages([
+                'estado_derivacion' =>
+                'La configuración de estados de derivación está incompleta.',
+            ]);
+        }
+
+        $existeDerivacionAbierta = Derivacion::query()
+            ->where('documento_id', $documento->id)
+            ->whereIn('estado_id', $estadosAbiertos)
+            ->exists();
+
+        if ($existeDerivacionAbierta) {
+
+            throw ValidationException::withMessages([
+                'documento' =>
+                'El documento ya tiene una derivación abierta.',
+            ]);
+        }
+    }
+    /**
+     * Determina la ubicación lógica actual del documento.
+     */
+    private function determinarAreaActual(
+        Documento $documento,
+        int $nuevaAreaDestinoId
+    ): ?int {
+
         $codigosAbiertos = [
             'DER_PENDIENTE',
             'DER_ENVIADA',
@@ -404,16 +664,25 @@ class DerivacionService
             ]);
         }
 
-        $existeDerivacionAbierta = Derivacion::query()
+        /*
+     * La nueva derivación ya fue creada cuando llegamos
+     * a este método.
+     */
+        $cantidadAbiertas = Derivacion::query()
             ->where('documento_id', $documento->id)
             ->whereIn('estado_id', $estadosAbiertos)
-            ->exists();
+            ->count();
 
-        if ($existeDerivacionAbierta) {
-            throw ValidationException::withMessages([
-                'documento' =>
-                'El documento ya tiene una derivación abierta.',
-            ]);
+        /*
+     * Una única ruta activa.
+     */
+        if ($cantidadAbiertas <= 1) {
+            return $nuevaAreaDestinoId;
         }
+
+        /*
+     * Dos o más rutas activas.
+     */
+        return null;
     }
 }

@@ -30,6 +30,10 @@ class DatabaseSeeder extends Seeder
 
             UserSeeder::class,
             UserCargoSeeder::class,
+          
+            UsuariosInstitucionalesSeeder::class,
+            UserCargoInstitucionalSeeder::class,
+          
         ]);
 
 
